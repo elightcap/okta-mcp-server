@@ -25,7 +25,7 @@ This server is an [Model Context Protocol](https://modelcontextprotocol.io/intro
 ## Key Features
 
 * **LLM-Driven Okta Management:** Allows your LLM agents to perform administrative tasks within your Okta environment based on natural language instructions.
-* **Secure Authentication:** Supports both Device Authorization Grant for interactive use and Private Key JWT for secure, automated server-to-server communication.
+* **Secure Authentication:** Supports both Device Authorization Grant for interactive use and Private Key JWT for secure, automated server-to-server communication, plus a per-user OAuth mode for remote deployments in which every caller acts with their own Okta admin role.
 * **Interactive Confirmation via Elicitation:** Destructive operations (deletes, deactivations) prompt the user for confirmation through the [MCP Elicitation API](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation) before proceeding, with automatic fallback for clients that do not yet support the feature.
 * **Integration with Okta Admin Management APIs:** Leverages the official Okta APIs to ensure secure and reliable interaction with your Okta org.
 * **Extensible Architecture:** Designed to be easily extended with new functionalities and support for additional Okta API endpoints.
@@ -545,6 +545,60 @@ The server supports two authentication methods. Choose the one that best fits yo
 4. **Grant API Scopes:** Go to the **Okta API Scopes** tab and **Grant** permissions for the APIs you need.
 5. **Assign Admin Roles:** Go to the **Admin roles** tab and assign the appropriate admin role to this application.
 
+**Method 3: Per-user OAuth (Remote / Shared Deployments)**
+
+Methods 1 and 2 give the server a single Okta identity, so everyone who can reach the server shares that identity's permissions. For a shared deployment behind an MCP gateway such as [LiteLLM](https://docs.litellm.ai/docs/mcp_oauth), user auth mode instead requires every request to carry the caller's own Okta access token. The server forwards that token to the Okta API, so each caller can do only what **their own Okta admin role** allows, and only users assigned to the app can sign in at all.
+
+1. **Create App:** In your Okta org, create a **new App Integration**. Select **OIDC - OpenID Connect** and **Web Application**.
+2. **Grant types:** Check **Authorization Code** and **Refresh Token**.
+3. **Sign-in redirect URI:** Set this to your MCP client's OAuth callback. For LiteLLM it is `<proxy origin>/callback`, e.g. `https://llm.example.com/callback`.
+4. **Assignments:** Assign the app only to the users or group (e.g. `Okta MCP Admins`) who should be able to use the server. Unassigned users cannot obtain a token.
+5. **Grant API Scopes:** On the **Okta API Scopes** tab, grant the scopes you list in `OKTA_SCOPES`.
+6. **Run the server over HTTP in user mode:**
+   ```bash
+   OKTA_ORG_URL=https://your-org.okta.com
+   OKTA_CLIENT_ID=<web app client id>
+   OKTA_SCOPES="okta.users.read okta.groups.read"
+   OKTA_MCP_TRANSPORT=streamable-http
+   OKTA_MCP_HOST=0.0.0.0
+   OKTA_AUTH_MODE=user
+   OKTA_MCP_PUBLIC_URL=https://okta-mcp.example.com/mcp
+   OKTA_CLIENT_SECRET=<web app client secret>   # optional, enables server-side refresh (step 8)
+   ```
+   The MCP endpoint is served at `/mcp`. Requests without a valid token get `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource/mcp`, which names your Okta org as the authorization server.
+7. **Configure the MCP client.** For LiteLLM:
+   ```yaml
+   mcp_servers:
+     okta:
+       url: https://okta-mcp.example.com/mcp
+       auth_type: oauth2
+       oauth2_flow: authorization_code
+       client_id: os.environ/OKTA_MCP_CLIENT_ID
+       client_secret: os.environ/OKTA_MCP_CLIENT_SECRET
+       authorization_url: https://your-org.okta.com/oauth2/v1/authorize
+       token_url: https://your-org.okta.com/oauth2/v1/token
+       scopes: [openid, profile, email, offline_access, okta.users.read, okta.groups.read]
+   ```
+8. **Keep long sessions alive (optional).** Okta access tokens expire after an hour, so a caller whose token lapses starts getting `401`s even though its refresh token is still valid. With `OKTA_CLIENT_SECRET` set, a client can hand the server that refresh token instead of refreshing on its own:
+
+   ```
+   POST /mcp HTTP/1.1
+   Authorization: Bearer <access token>
+   X-Okta-Refresh-Token: <refresh token>
+   ```
+
+   When the bearer token is expired or about to expire, the server runs the `refresh_token` grant, uses the new access token for that request, and returns the rotated refresh token — if Okta rotated one — in the same `X-Okta-Refresh-Token` response header. Requests whose bearer token is still valid never reach the token endpoint, and requests without the header are untouched, so clients that refresh themselves (like the LiteLLM configuration above) need no changes. Okta issues a refresh token only when the client asked for `offline_access`, which that configuration already requests.
+
+   A caller's refresh token is held in process memory only — never in the keyring or on disk — and is dropped as soon as Okta refuses it. Callers that keep presenting a refresh token they already rotated still work: the server holds the rotated value for that session. Because the server runs the grant with the app's own secret, it will reissue tokens for any refresh token it is handed, so keep the MCP endpoint reachable only from your own MCP clients — as you must anyway, since any request it accepts runs Okta calls as that caller.
+
+How tokens are checked:
+
+* Tokens must come from the Okta **org** authorization server (`/oauth2/v1/...`). Custom authorization servers such as `default` cannot issue `okta.*` scopes and are rejected.
+* Each token is validated by Okta's `/oauth2/v1/userinfo` endpoint, and its `cid` claim must equal `OKTA_CLIENT_ID`, so tokens minted for other apps are rejected. Successful checks are cached for up to five minutes.
+* Every token must carry `openid` and **all** of `OKTA_SCOPES`; request all of them in the client's scope list, or the server answers `403 insufficient_scope`.
+* An Okta API `403` in this mode means the caller's admin role does not allow the action, and the tool error says so.
+* The server holds no admin credentials of its own in this mode: `OKTA_PRIVATE_KEY` and `OKTA_KEY_ID` are ignored and nothing is written to the keyring. `OKTA_CLIENT_SECRET`, when set, is used only to run the `refresh_token` grant for callers whose access token has expired.
+
 ### Verify your integration
 
 Restart your MCP Client (Claude Desktop, VS Code, etc.) and ask it to help you manage your Okta tenant:
@@ -846,6 +900,7 @@ The MCP Server will automatically initiate the appropriate authentication flow b
 
 - **Device Authorization Grant**: Interactive browser-based authentication
 - **Private Key JWT**: Browserless authentication using client credentials
+- **Per-user OAuth** (`OKTA_AUTH_MODE=user`): No server-side authentication; each request carries the caller's own Okta access token
 
 > [!NOTE]
 > Device authorization flow is not supported for **private cloud** tenants. Private Cloud users should use Private Key JWT authentication with client credentials.
